@@ -1,0 +1,1978 @@
+---
+title: "Customer At Risk Model"
+output: html_notebook
+---
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+suppressWarnings(suppressWarnings(library(lubridate)))
+suppressWarnings(suppressWarnings(library(pdp)))
+suppressWarnings(suppressWarnings(library(caretEnsemble)))
+suppressWarnings(suppressWarnings(library(doParallel)))
+suppressWarnings(suppressWarnings(library(tidyr)))
+suppressWarnings(suppressWarnings(library(bit64)))
+suppressWarnings(suppressWarnings(library(foreign)))
+suppressWarnings(suppressWarnings(library(RODBC)))
+suppressWarnings(suppressWarnings(library(caret)))
+suppressWarnings(suppressWarnings(library(dplyr)))
+suppressWarnings(suppressWarnings(library(data.table)))
+suppressWarnings(suppressWarnings(library(ggplot2)))
+suppressWarnings(suppressWarnings(library(caret)))
+suppressWarnings(suppressWarnings(library(xgboost)))
+suppressWarnings(suppressWarnings(library(sjmisc)))
+suppressWarnings(suppressWarnings(library(DMwR)))
+suppressWarnings(suppressWarnings(library(pROC)))
+suppressWarnings(suppressWarnings(library(ROCR)))
+```
+
+
+### Training data construction
+
+- Independent variables date range: up to Dec 2018
+- Dependent variable date range: Feb-Arp 2019
+- We intentionally leave a one month gap between the two so that
+  1. We can have all the data needed to make predictions
+  2. We can have time to think about how to execute on the predictions. 
+
+
+Pull R12 historical sales by product segmentation. 
+Calculate % of sales by segmentation.
+This has to be done locally.
+
+```{r}
+myconn <- odbcConnect("Teradata LDAP")
+prod_seg <- sqlQuery(myconn, "select * from prd_dwh_view_lmt.Material_Product_Segmentation_view")
+prod_seg <- filter(prod_seg, is.na(PROD_SEG) != T)
+prod_sales <- sqlQuery(myconn, "SELECT b.BUS_LOCATION_ID, SI.fiscper, p.cat_ID, 
+                  SUM(SI.SUBTOTAL_2) as sales 
+                  FROM PRD_DWH_VIEW_LMT.Mdm_Account_Org_Summary_view b RIGHT JOIN 
+                  PRD_DWH_VIEW_LMT.Sales_Invoice_V SI ON SI.SOLD_TO=b.SAP_ACCT_ID
+                  LEFT JOIN PRD_DWH_VIEW_LMT.PROD_HIER_V p ON SI.prod_hier = p.prod_hier
+                  WHERE SI.ZZCOMFLG = 'Y' AND
+                  SI.COMP_CODE = '0300' AND
+                  SI.ZPOSTSTAT = 'C' AND
+                  SI.FISCPER  BETWEEN  2018001  AND  2018012 AND
+                  SI.ACCNT_ASGN IN ('01','20')
+                  GROUP BY 1, 2, 3")
+prod_seg_sales <- inner_join(prod_sales, prod_seg, by = c("cat_id" = "CAT_ID")) %>%
+  group_by(BUS_LOCATION_ID, PROD_SEG) %>%
+  summarise(sales = sum(sales, na.rm = T)) %>%
+  group_by(BUS_LOCATION_ID) %>%
+  mutate(per=paste0(round(sales/sum(sales)*100, 2), "%")) %>% 
+  ungroup()
+View(prod_seg_sales)
+odbcClose(myconn)
+```
+
+
+Reshape the dataset. 
+Recode missing values
+
+```{r}
+sales <- prod_seg_sales %>% 
+  select(-per) %>%
+  spread(PROD_SEG, sales) %>%
+  rename_at(vars(2:ncol(sales)), ~ paste0(., "_sales"))
+ 
+pct <- prod_seg_sales %>% 
+  select(-sales) %>%
+  spread(PROD_SEG, per) %>%
+  rename_at(vars(2:ncol(per)), ~ paste0(., "_pct"))
+
+prod_seg_sales_reshaped <- full_join(sales, pct) %>%
+  replace(is.na(.), 0)
+write.csv(prod_seg_sales_reshaped, "prod_seg_sales.csv", row.names = F)
+
+```
+
+Import prod seg sales.
+```{r}
+prod_seg_sales <- fread("prod_seg_sales.csv", data.table = F)
+str(prod_seg_sales)
+```
+
+
+Import NEW model file as of April 2019. Exclude off-account locations. This is our dependent variable. 
+```{r}
+sales_3M <- fread('/hadoop/grainger/data_science/inputFiles/modelFiles/201904_Apr_merged_model_file_NEW.csv', data.table = F)
+sales_3M <- sales_3M %>%
+  filter(ACCOUNT %in% c(111111118, 222222226, 244444444) == F) %>%
+  mutate(Trans_3M = TRANS03 + TRANS02 + TRANS01) %>%
+  select(ACCOUNT, Trans_3M)
+str(sales_3M)
+```
+
+
+Import new model file as of Dec 2018. Exclude off-account locations. This will be for our independent variables. 
+```{r}
+model_file <- fread('/hadoop/grainger/data_science/inputFiles/modelFiles/201812_Dec_merged_model_file_NEW.csv', data.table = F)
+model_file <- filter(model_file, ACCOUNT %in% c(111111118, 222222226, 244444444) == F)
+```
+
+
+merge the two files using account number first. 
+
+- it's not a good idea to aggregate the two files to BUS LOC level and then merge the two files because bus location ID got re-stated often.
+```{r}
+merge <- left_join(model_file, sales_3M, by = "ACCOUNT")
+rm(model_file)
+rm(sales_3M)
+```
+
+
+Aggregate data from account to location level
+```{r}
+loc_aggr_sum <- merge %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(BRNCH_S12X:INVLNS24, TRANS36:WA_S12X, LINES12X:WLDGN24X, Trans_3M), sum, na.rm = T) 
+### had to split the following commands because otherwise it was taking long. 
+merge <- merge %>% arrange(desc(-BUS_LOC_ID), desc(SALES12X), desc(mrospend))
+
+loc_aggr_first <- merge %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(CSG, EMPHERE, DUNSYRST:dunspop, indseg1, Corp_Maj_Flag, market_segment), first)
+
+# loc_aggr_first <- model_file %>%
+#   arrange(desc(SALES12X)) %>%
+#   group_by(BUS_LOC_ID) %>%
+#   summarise_at(vars(CSG, indseg1, Corp_Maj_Flag, market_segment), first)
+
+loc_aggr_min <- merge %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(RECENCY, DISTANCE, mro_decile), min)
+
+loc_aggr_max <- merge %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(TENURE, mrospend, INVSOLFLG, multisite, CONTRACT_FLAG), max)
+
+
+loc_aggr <- full_join(loc_aggr_sum, loc_aggr_first) %>%
+  full_join(loc_aggr_min) %>%
+  full_join(loc_aggr_max)
+
+rm(loc_aggr_first)
+rm(loc_aggr_sum)
+rm(loc_aggr_min)
+rm(loc_aggr_max)
+loc_aggr <- ungroup(loc_aggr)
+str(loc_aggr)
+rm(merge)
+```
+
+
+Merge location aggr with prod seg sales data
+```{r}
+loc_aggr <- left_join(loc_aggr, prod_seg_sales, by = c("BUS_LOC_ID" = "BUS_LOCATION_ID")) %>%
+  filter(BUS_LOC_ID != 0)
+summary(loc_aggr$Trans_3M)
+loc_aggr <- loc_aggr %>%
+  mutate(Trans_3M = ifelse(is.na(Trans_3M), 0, Trans_3M))
+rm(prod_seg_sales)
+
+```
+
+### Feature engineering
+- convert data types
+- create pre period transaction variables, 3M, 6M, 12M, etc. 
+- create % of sales by traditional prod segmentation.
+- standardize the variable names by removing spaces.
+- Add % of sales by channel
+- One-hot encoding
+- Create dependent variable - lapse flag
+
+```{r}
+loc_aggr <- loc_aggr %>%
+  mutate(BUS_LOC_ID = as.character(BUS_LOC_ID),
+         mro_decile = as.factor(mro_decile),
+         Corp_Maj_Flag = as.factor(Corp_Maj_Flag),
+         multisite = as.factor(multisite),
+         indseg1 = as.factor(indseg1),
+         CONTRACT_FLAG = as.factor(CONTRACT_FLAG),
+         coverage = ifelse(substr(CSG, 1, 2) %in% seq(72, 78), "ISA",
+                           ifelse(substr(CSG, 1, 2) %in% c(84, 88), "AM",
+                                  ifelse(substr(CSG, 1, 2) == 83, "FAR", 
+                                         ifelse(substr(CSG, 1, 2) == 89, "Gov ARM",
+                                                       "Uncovered")))),
+         coverage = as.factor(coverage),
+         lapse = as.factor(ifelse(Trans_3M == 0, "Yes", "No")),
+         dunsman = as.factor(dunsman),
+         dunsstat = as.factor(dunsstat),
+         dunssub = as.factor(dunssub),
+         Trans_3M_pre = rowSums(select(., TRANS03:TRANS01)),
+         Trans_6M_pre = rowSums(select(., TRANS06:TRANS01)),
+         Trans_12M_pre = rowSums(select(., TRANS12:TRANS01)),
+         SALES_3M_pre = rowSums(select(., SALES03:SALES01)),
+         SALES_6M_pre = rowSums(select(., SALES06:SALES01)),
+         SALES_12M_pre = rowSums(select(., SALES12:SALES01))
+         )
+
+pct_cal <- sapply(names(loc_aggr)[which(colnames(loc_aggr) == "ABRVS12X"):which(colnames(loc_aggr) == "WLDGS12X")], function(x) {
+  loc_aggr[paste0(x, "_pct")] <<- loc_aggr[x] / loc_aggr$SALES12X
+})
+rm(pct_cal)
+colnames(loc_aggr) <- make.names(names(loc_aggr), unique=TRUE)
+names(loc_aggr)
+```
+
+
+One hot encoding
+
+- Check how many factor variables are there in the dataset and create dummy variables
+- Leave dummy variables as numeric because xgboost only takes in numeric variables. 
+```{r, echo=TRUE}
+names(Filter(is.factor, loc_aggr))
+loc_aggr <- loc_aggr %>% 
+  to_dummy(c(Corp_Maj_Flag, mro_decile, indseg1, CONTRACT_FLAG, multisite, coverage, dunsstat, dunssub, dunsman), suffix = "label") %>%
+  bind_cols(loc_aggr) %>%
+  select(BUS_LOC_ID:DISTANCE, everything(), -c(mro_decile, indseg1, Corp_Maj_Flag,
+                                               CONTRACT_FLAG, multisite, coverage, dunsstat, dunssub, dunsman))
+names(Filter(is.factor, loc_aggr))
+```
+
+### Impute missing vlaues
+Recode distance and sales by Boldt's segmentation (those locations didn't have sales that fall into the segmentations). Recode multiple columns from missing values to zero. 
+
+Missing values happen because - 
+- some number of locations didn't have sales that fall into the Boldt segmentation
+- divide by zero sales12x.
+
+Drop empty levels for factor variables.
+```{r}
+sort(colSums(is.na(loc_aggr)))
+loc_aggr <- loc_aggr %>%
+  mutate(DISTANCE= ifelse(is.na(DISTANCE), mean(DISTANCE, na.rm=TRUE), DISTANCE)) %>%
+  replace(is.na(.), 0)
+
+sort(colSums(is.na(loc_aggr)))
+which(sapply(loc_aggr, is.factor))
+which(sapply(loc_aggr, is.character))
+sapply(loc_aggr, class)
+
+### Recode percentage variables to be between 0 and 1.
+loc_aggr <- cbind(select(loc_aggr, BUS_LOC_ID:SALES_12M_pre),
+                  lapply(select(loc_aggr, ABRVS12X_pct:WLDGS12X_pct), 
+                         function(x){
+  x = ifelse(x > 1, 1, ifelse(x < 0, 0, x))
+}))
+
+
+loc_aggr <- loc_aggr %>%
+  select(ABRVS12X_pct:WLDGS12X_pct) %>%
+  mutate_all(funs(replace(., which(.<0), 0)),
+             funs(replace(., which(.>1), 1))) %>%
+  cbind(loc_aggr) %>%
+  select(BUS_LOC_ID:SALES_12M_pre, ABRVS12X_pct:WLDGS12X_pct)
+
+
+```
+
+**Limit the training population to those locations that were active in the previous month**
+```{r}
+prop.table(table(loc_aggr$lapse))
+eligible <- loc_aggr %>%
+  filter(TRANS01 > 0)
+table(eligible$lapse)
+prop.table(table(eligible$lapse))
+# Verify below. 
+nrow(filter(loc_aggr, TRANS05 > 0 & rowSums(select(loc_aggr, TRANS03:TRANS01)) == 0))
+nrow(filter(loc_aggr, TRANS06 > 0 & rowSums(select(loc_aggr, TRANS04:TRANS02)) == 0))
+nrow(filter(loc_aggr, TRANS04 > 0 & rowSums(select(loc_aggr, TRANS03:TRANS01)) == 0))
+
+
+nrow(filter(loc_aggr, TRANS01 > 0 & Trans_3M == 0))
+```
+
+### Customer profiling
+```{r}
+### compare different cohorts of 3-month-inactive customers. 
+loc_aggr %>%
+  select(-lapse, -SALES_12M_pre, -Trans_3M) %>%
+  filter(TRANS10 > 0) %>%
+  mutate(Trans_3M = rowSums(select(., TRANS08:TRANS06)),
+         lapse = ifelse(Trans_3M == 0, "Yes", "No"),
+         sales_pre12 = rowSums(select(., SALES21:SALES10))) %>%
+  group_by(lapse) %>%
+  summarise(count = n(),
+            sales_avg = mean(sales_pre12),
+            sales_total = sum(sales_pre12),
+            mrospend_avg = mean(mrospend))
+
+loc_aggr %>%
+  select(-lapse, -SALES_12M_pre, -Trans_3M) %>%
+  filter(TRANS06 > 0) %>%
+  mutate(Trans_3M = rowSums(select(., TRANS04:TRANS02)),
+         lapse = ifelse(Trans_3M == 0, "Yes", "No"),
+         sales_pre12 = rowSums(select(., SALES17:SALES06))) %>%
+  group_by(lapse) %>%
+  summarise(count = n(),
+            sales_avg = mean(sales_pre12),
+            sales_total = sum(sales_pre12),
+            mrospend_avg = mean(mrospend))
+
+loc_aggr %>%
+  select(-lapse, -SALES_12M_pre, -Trans_3M) %>%
+  filter(TRANS05 > 0) %>%
+  mutate(Trans_3M = rowSums(select(., TRANS03:TRANS01)),
+         lapse = ifelse(Trans_3M == 0, "Yes", "No"),
+         sales_pre12 = rowSums(select(., SALES16:SALES05)),
+         trans_pre12 = rowSums(select(., TRANS16:TRANS05))) %>%
+  group_by(lapse) %>%
+  summarise(count = n(),
+            sales_avg = mean(sales_pre12),
+            sales_total = sum(sales_pre12),
+            mrospend_avg = mean(mrospend),
+            trans_avg = mean(trans_pre12))
+
+loc_aggr %>%
+  select(-lapse, -SALES_12M_pre) %>%
+  filter(TRANS01 > 0) %>%
+  mutate(lapse = ifelse(Trans_3M == 0, "Yes", "No"),
+         sales_pre12 = rowSums(select(., SALES12:SALES01))) %>%
+  group_by(lapse) %>%
+  summarise(count = n(),
+            sales_avg = mean(sales_pre12),
+            sales_total = sum(sales_pre12),
+            mrospend_avg = mean(mrospend))
+```
+
+
+#### Plot the 3-month lapse rate
+```{r}
+### Look at Jan 2017 as an example.
+loc_aggr %>%
+  filter(TRANS24 > 0 & rowSums(select(., TRANS22:TRANS20)) == 0) %>% tally()
+
+## change the name of the trans variables so that the loop can work. 
+profiling <- loc_aggr
+colnames(profiling)[80:115] <- paste0("trans", seq(36, 1, -1))
+colnames(profiling)[116:151] <- paste0("sales", seq(36, 1, -1))
+df_count <- data.frame("active_in_month_count" = integer(), 
+                       "three_month_lapse_count" = integer())
+df_count
+
+for (i in seq(24, 5, by = -1)){
+  active_in_month_count <- profiling %>% filter_(paste0("trans", i, ">0")) %>% tally()
+  three_month_lapse_count = profiling %>% filter_(paste0("trans", i, ">0")) %>%
+    filter_(paste0("trans", i - 2, "+", "trans", i - 3, "+", "trans", i-4, " == 0")) %>%
+    tally()
+  three_month_lapse_sales <- sum(three_month_lapse_locs$three_month_lapse_sales)
+  
+  df_count <- rbind(df_count, 
+                        data.frame(active_in_month_count,
+                             three_month_lapse_count))
+  }
+
+names(df_count) <- c("active_in_month_count", 
+                     "three_month_lapse_count")
+
+df_count$cohort <- seq(as.Date("2017/1/1"), as.Date("2018/8/1"), by="1 month")
+df_count
+
+## dollars at risk
+sales <- data.frame("active_in_month_sales" = integer(),
+                    "three_month_lapse_sales" = integer())
+for (i in seq(24, 5, by = -1)){
+  active_in_month_locs = profiling %>% filter_(paste0("trans", i, ">0")) %>%
+    mutate_(active_in_month_sales = paste0("rowSums", "(select(", "., ", paste0("sales", i+11, ":", "sales", i, "))" )))
+  active_in_month_sales <- sum(active_in_month_locs$active_in_month_sales)
+  three_month_lapse_locs = profiling %>% filter_(paste0("trans", i, ">0")) %>%
+    filter_(paste0("trans", i - 2, "+", "trans", i - 3, "+", "trans", i - 4, " == 0")) %>%
+    mutate_(three_month_lapse_sales = paste0("rowSums", "(select(", "., ", paste0("sales", i+11, ":", "sales", i, "))" )))
+  three_month_lapse_sales <- sum(three_month_lapse_locs$three_month_lapse_sales)
+  sales <- rbind(sales, data.frame(active_in_month_sales,
+                                   three_month_lapse_sales))
+}
+
+names(sales) <- c("active_in_month_sales", 
+                  "three_month_lapse_sales")
+sales$month <- seq(as.Date("2017/1/1"), as.Date("2018/8/1"), by="1 month")
+sales
+
+
+loc_aggr %>%
+  filter(TRANS05 > 0) %>% tally() %>%
+  bind_cols(loc_aggr %>%
+  filter(TRANS05 > 0 & rowSums(select(., TRANS03:TRANS01)) == 0) %>% tally())
+
+```
+
+### Create training data and validation data
+```{r}
+set.seed(3)
+trainIndex <- createDataPartition(eligible$lapse, p = .8, 
+                                  list = FALSE, 
+                                  times = 1)
+train_data <- eligible[ trainIndex,]
+vali_data  <- eligible[-trainIndex,]
+prop.table(table(train_data$lapse))
+prop.table(table(vali_data$lapse))
+```
+
+### Model building
+
+#### Build an xgboost model using all variables.
+Initialize all the hyperparameters to the following:
+
+* nrounds: pick a good number to start 250 (can be tricky to pick this number)
+- eta = 0.1
+- min_child_weight = 1
+- max_depth = 5
+- gamma = 0
+- colsample_bytree = 0.8
+- subsample = 0.8
+
+Set eta = 0.1, initialize all other parameters and tune nrounds. 
+Set nrounds to be the chosen number from the previous step, then tune max_depth and min_child_weight.
+Tune subsample and colsample_bytree
+Then tune gamma
+reduce eta and increase nrounds. 
+
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision
+1     0.8322687    0.50277 0.8465923  0.924926 0.5394782 0.9328043      0.8638826
+  TrainRecall    TrainF  method
+1    0.924926 0.8933615 xgbTree
+
+```{r}
+### create a function that shows a lot of metrics. 
+MySummary  <- function(data, lev = NULL, model = NULL){
+  a1 <- defaultSummary(data, lev, model)
+  b1 <- twoClassSummary(data, lev, model)
+  c1 <- prSummary(data, lev, model)
+  out <- c(a1, b1, c1)
+  out}
+cl <- makePSOCKcluster(20)
+registerDoParallel(cl)
+time_start <- proc.time()
+set.seed(3)
+xgboost <- train(x = select(train_data, -c(BUS_LOC_ID, Trans_3M, lapse)),
+                 y = train_data$lapse, 
+                 method = "xgbTree",
+                 metric = "ROC",
+                 trControl = trainControl(method = "cv",
+                                          number = 5,
+                                          summaryFunction = MySummary,
+                                          classProbs = T),
+                 tuneGrid =  expand.grid(nrounds = 200, #the maximum number of iterations
+                                         eta = 0.1, # shrinkage
+                                         max_depth = 5, # max depth of a tree
+                                         gamma = 0,
+                                         colsample_bytree = 0.7,
+                                         min_child_weight = 1, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 0.7))
+getTrainPerf(xgboost)
+xgboost$results
+proc.time() - time_start
+stopCluster(cl)
+
+```
+
+##### Validate the model
+- Use gains chart to evaluate performance on holdout set.
+
+```{r}
+### in lift function, depvar is numeric. 
+lift <- function(depvar, predcol, groups=10) {
+  if(!require(dplyr)){
+    install.packages("dplyr")
+    library(dplyr)}
+  if(is.factor(depvar)) depvar <- as.integer(as.character(depvar))
+  if(is.factor(predcol)) predcol <- as.integer(as.character(predcol))
+  helper = data.frame(cbind(depvar, predcol))
+  helper[,"bucket"] = ntile(-helper[,"predcol"], groups)
+  gaintable = helper %>% group_by(bucket)  %>%
+    summarise_at(vars(depvar), funs(total = n(),
+                                    totalresp=sum(., na.rm = TRUE),
+                                    avg_score = mean(predcol, na.rm = TRUE))) %>%
+    mutate(Cumresp = cumsum(totalresp),
+           Gain=Cumresp/sum(totalresp)*100,
+           Cumlift=Gain/(bucket*(100/groups)))
+  return(gaintable)
+}
+
+val_score <- predict(xgboost, newdata = vali_data, type = "prob")
+
+dt = lift(vali_data$lapse == "Yes", val_score[, 2], groups = 10)
+dt
+plot(dt$bucket, dt$Cumlift, type="l", ylab="Cumulative lift", xlab="Bucket")
+
+## this just validates that highest ventile has the highest score, which is to be expected. 
+score_ventile = ntile(-val_score[,  2], 20)
+barplot(tapply(val_score[, 2], score_ventile, mean), main = "Score vs ventile")
+
+## This proves that highest ventile has the highest % of lapse customers. 
+vali_data <- vali_data %>%
+  mutate(label = lapse == "Yes")
+barplot(tapply(vali_data$label, score_ventile, mean), main = "% of lapse vs ventile")
+```
+
+
+#### Variable selection
+Select the top 31 most important variables. 
+```{r}
+imp <- data.frame(names = rownames(varImp(xgboost)$importance), varImp(xgboost, scale = F)$importance)
+rownames(imp) <- NULL
+imp[order(imp[, 2], decreasing = T), ]
+plot(varImp(xgboost))
+vars <- imp[order(imp[, 2], decreasing = T), ]$names[1:31]
+vars <- droplevels(vars)
+# the following line is critical.
+vars <- as.character(vars)
+# names(eligible_contacts[, vars])
+vars <- vars[vars != "Trans_12M_pre"]
+
+```
+
+#### Build a new model using the most important variables
+
+  nrounds max_depth eta gamma colsample_bytree min_child_weight subsample
+1     200         5 0.1     0              0.7                1       0.7
+
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision
+1     0.8315526  0.4992019 0.8453429 0.9256916 0.5340798 0.9311939      0.8626035
+  TrainRecall    TrainF  method
+1   0.9256916 0.8930338 xgbTree
+
+  nrounds max_depth eta gamma colsample_bytree min_child_weight subsample
+1     200         3 0.1     0              0.7                1       0.7
+
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision
+1     0.8322591  0.5020767 0.8460444 0.9254891 0.5376587 0.9315554      0.8634904
+  TrainRecall    TrainF  method
+1   0.9254891 0.8934141 xgbTree
+
+
+  nrounds max_depth eta gamma colsample_bytree min_child_weight subsample
+1     200         3 0.1     0              0.7                2       0.7
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision TrainRecall    TrainF  method
+1     0.8321822  0.5017336 0.8460514 0.9255397 0.5371788 0.9316139      0.8633737   0.9255397 0.8933755 xgbTree
+
+
+  nrounds max_depth eta gamma colsample_bytree min_child_weight subsample
+3     200         3 0.1     0              0.5                2       0.7
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision TrainRecall   TrainF  method
+1     0.8323793  0.5025081 0.8460352 0.9255081 0.5380986 0.9318037       0.863604   0.9255081 0.893484 xgbTree
+
+
+  nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+8    2900         3 0.01     1              0.5                2       0.7
+
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC
+1     0.8325811  0.5022715 0.8464504 0.9263559 0.5362591 0.9320121
+  TrainPrecision TrainRecall    TrainF  method
+1      0.8632438   0.9263559 0.8936858 xgbTree
+
+
+  nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+4    3300         3 0.01     1              0.5                2       0.7
+
+- after correcting the merging and aggregation process
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision
+1     0.8658409  0.5620259 0.9118613 0.9331253 0.6004228 0.9761977      0.9020779
+  TrainRecall    TrainF  method
+1   0.9331253 0.9173381 xgbTree
+
+- removed duplicated trans12x. 
+  nrounds max_depth  eta gamma colsample_bytree min_child_weight subsample
+1    3300         3 0.01     1              0.5                2       0.7
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision
+1     0.8657881  0.5618246 0.9118684 0.9331132 0.6002089 0.9762071      0.9020295
+  TrainRecall    TrainF  method
+1   0.9331132 0.9173073 xgbTree
+
+```{r}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(3)
+xgboost_vars <- train(x = select(train_data, vars),
+                 y = train_data$lapse, 
+                 method = "xgbTree",
+                 metric = "ROC",
+                 trControl = trainControl(method = "cv",
+                                          number = 5,
+                                          summaryFunction = MySummary,
+                                          classProbs = T),
+                 tuneGrid =  expand.grid(nrounds = 3300, #the maximum number of iterations
+                                         eta = 0.01, # shrinkage
+                                         max_depth = 3, # max depth of a tree
+                                         gamma = 1,
+                                         colsample_bytree = 0.5,
+                                         min_child_weight = 2, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 0.7))
+
+stopCluster(cl)
+getTrainPerf(xgboost_vars)
+# ggplot(varImp(xgboost_vars, scale = F))
+proc.time() - time_start
+ggplot(xgboost_vars)
+
+featurePlot(x = select(train_data, vars), 
+            y = train_data$lapse,
+            plot = "box",
+            strip=strip.custom(par.strip.text=list(cex=.7)),
+            scales = list(x = list(relation="free"), 
+                          y = list(relation="free")))
+
+score <- predict(xgboost_vars, newdata = train_data[, vars], type = "prob")
+train_data <- train_data %>%
+  mutate(lapse_score = score[, 2])
+filter(train_data, BUS_LOC_ID == '918052114697506969')$lapse_score
+filter(train_data, BUS_LOC_ID == '827352127749169327')$lapse_score
+filter(train_data, BUS_LOC_ID == '753852127929835617')$lapse_score
+filter(train_data, BUS_LOC_ID == '267444888603379502')$lapse_score
+```
+
+
+
+#### validate the new model
+```{r}
+val_score <- predict(xgboost_vars, newdata = vali_data[, vars], type = "prob")
+
+confusionMatrix(as.factor(val_score[, 2] > 0.5), as.factor(vali_data$lapse == "Yes"), positive = "TRUE")
+
+ROCRpred <- prediction(val_score[, 2], vali_data$lapse)
+as.numeric(performance(ROCRpred, "auc")@y.values)
+perf <- performance(ROCRpred,"tpr","fpr")
+plot(perf,colorize=TRUE)
+# AUC = 0.9124364
+
+## Gains chart
+dt = lift(vali_data$lapse == "Yes", val_score[, 2], groups = 10)
+dt
+plot(dt$bucket, dt$Cumlift, type="l", ylab="Cumulative lift", xlab="Score decile")
+
+## this just validates that highest ventile has the highest score, which is to be expected. 
+score_ventile = ntile(-val_score[,  2], 20)
+barplot(tapply(val_score[, 2], score_ventile, mean), main = "Score vs ventile")
+
+## This proves that highest ventile has the highest % of lapse customers. 
+barplot(tapply(vali_data$label, score_ventile, mean), main = "% of lapse vs ventile", xlab = "score ventile", ylab = "% of locations lapsed")
+
+vali_data <- cbind(vali_data, val_score[, 2])
+colnames(vali_data)[ncol(vali_data)] <- "score"
+vali_data %>%
+  mutate(label = lapse == "Yes",
+         score_ventile = ntile(-score, 20)) %>%
+  group_by(score_ventile) %>%
+  summarise(score = mean(score))
+
+```
+
+
+#### Build a glm model
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec   TrainAUC TrainPrecision
+1     0.7864355  0.1174352 0.5579789 0.9416025 0.1743553 0.04835679      0.8214544
+  TrainRecall    TrainF method
+1   0.9416025 0.8746316    glm
+```{r}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(3)
+glm_model <- train(x = select(train_data, vars),
+                 y = train_data$lapse, 
+                 method = "glm",
+                 metric = "ROC",
+                 trControl = trainControl(method = "cv",
+                                          number = 5,
+                                          summaryFunction = MySummary,
+                                          classProbs = T),
+                 family = "binomial")
+
+stopCluster(cl)
+getTrainPerf(glm_model)
+proc.time() - time_start
+```
+
+Validate the model
+```{r}
+val_score <- predict(glm_model, newdata = vali_data[, vars], type = "prob")
+
+dt = lift(vali_data$lapse == "Yes", val_score[, 2], groups = 10)
+dt
+plot(dt$bucket, dt$Cumlift, type="l", ylab="Cumulative lift", xlab="Bucket")
+
+## this just validates that highest ventile has the highest score, which is to be expected. 
+score_ventile = ntile(-val_score[,  2], 20)
+barplot(tapply(val_score[, 2], score_ventile, mean), main = "Score vs ventile")
+
+## This proves that highest ventile has the highest % of lapse customers. 
+vali_data <- vali_data %>%
+  mutate(label = lapse == "Yes")
+barplot(tapply(vali_data$label, score_ventile, mean), main = "% of lapse vs ventile")
+```
+
+
+#### Build a random forest model
+
+  TrainAccuracy TrainKappa  TrainROC TrainSens TrainSpec  TrainAUC TrainPrecision TrainRecall   TrainF method
+1     0.8301876  0.4925688 0.8401906 0.9269507 0.5244227 0.9284337      0.8603201   0.9269507 0.892391     rf
+
+```{r}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(3)
+RF_model <- train(x = select(train_data, vars),
+                 y = train_data$lapse, 
+                 method = "rf",
+                 metric = "ROC",
+                 trControl = trainControl(method = "cv",
+                                          number = 5,
+                                          summaryFunction = MySummary,
+                                          classProbs = T),
+                 tuneGrid =  expand.grid(mtry = seq(18, 24, by = 1)))
+
+stopCluster(cl)
+getTrainPerf(RF_model)
+proc.time() - time_start
+ggplot(RF_model)
+```
+
+
+Validate the model
+```{r}
+val_score <- predict(RF_model, newdata = vali_data[, vars], type = "prob")
+
+dt = lift(vali_data$lapse == "Yes", val_score[, 2], groups = 10)
+dt
+plot(dt$bucket, dt$Cumlift, type="l", ylab="Cumulative lift", xlab="Bucket")
+
+## this just validates that highest ventile has the highest score, which is to be expected. 
+score_ventile = ntile(-val_score[,  2], 20)
+barplot(tapply(val_score[, 2], score_ventile, mean), main = "Score vs ventile")
+
+## This proves that highest ventile has the highest % of lapse customers. 
+vali_data <- vali_data %>%
+  mutate(label = lapse == "Yes")
+barplot(tapply(vali_data$label, score_ventile, mean), main = "% of lapse vs ventile")
+```
+
+#### Compare the three models by considering all the cross validation performance metrics
+```{r}
+models <- resamples(list(glm = glm_model, xgboost = xgboost_vars, RF = RF_model))
+summary(models)
+p1 <- ggplot(models, metric = "Accuracy") + ggtitle("Accuracy")
+p2 <- ggplot(models, metric = "AUC") + ggtitle("AUC")
+p3 <- ggplot(models, metric = "Sens") + ggtitle("Sensitivity")
+p4 <- ggplot(models, metric = "Spec") + ggtitle("Specificity")
+grid.arrange(p1, p2, p3, p4, ncol=2)
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+bwplot(models, scales=scales)
+save.image()
+```
+
+#### Stacking Algorithms
+```{r}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+time_start <- proc.time()
+trainControl <- trainControl(method="cv", 
+                             number=5, 
+                             index = createFolds(train_data$lapse, 5),
+                             savePredictions=TRUE, 
+                             classProbs=TRUE,
+                             summaryFunction = MySummary,
+                             allowParallel = TRUE)
+
+algorithmList <- c('rf', 'xgbTree', 'xgbLinear', 'glm')
+
+set.seed(100)
+models <- caretList(x = select(train_data, vars),
+                    y = train_data$lapse, 
+                    metric="ROC",
+                    trControl=trainControl, 
+                    methodList=algorithmList) 
+results <- resamples(models)
+summary(results)
+stopCluster(cl)
+proc.time() - time_start
+xyplot(results, metric = "ROC")
+scales <- list(x=list(relation="free"), y=list(relation="free"))
+bwplot(results, scales=scales)
+dotplot(results, metric = "ROC")
+
+# We can use the predict function to extract predicitons from this object for new data:
+p <- as.data.frame(predict(models, newdata=head(vali_data)))
+print(p)
+```
+
+#### Print out the performance of each model
+
+```{r}
+options(digits = 3)
+model_results <- data.frame(
+ glm = min(models$glm$results$ROC),
+ RF = min(models$rf$results$ROC),
+ XGB_tree = min(models$xgbTree$results$ROC),
+ XGB_linear = min(models$xgbLinear$results$ROC),
+ svmRadial = min(models$svmRadial$results$ROC)
+ )
+print(model_results)
+```
+
+#### check the correlation between the models. 
+Notice that some of the models are highly correlated. Therefore they are not good candidates for ensemble. 
+```{r}
+modelCor(resamples(models))
+```
+
+
+#### Create an ensemble model
+Even though the models turn out to have high correlation, we can still try out the ensemble model.
+AUC = 0.8437, which is only `r 0.8437/0.843 - 1` higher than the xgbTree model. 
+```{r}
+greedy_ensemble <- caretEnsemble(
+  models, 
+  metric="ROC",
+  trControl=trainControl(
+    number=5,
+    summaryFunction=MySummary,
+    classProbs=TRUE
+    ))
+summary(greedy_ensemble)
+
+
+## Validate the ensemble model. Poor model!!!! Overfitting!
+val_score <- predict(greedy_ensemble, newdata = vali_data[, vars], type = "prob")
+confusionMatrix(as.factor(val_score > 0.5), as.factor(vali_data$lapse == "Yes"), positive = "TRUE")
+
+dt = lift(vali_data$lapse == "Yes", val_score, groups = 10)
+dt
+plot(dt$bucket, dt$Cumlift, type="l", ylab="Cumulative lift", xlab="Bucket")
+```
+
+
+### Buil the final model using the entire training data.
+```{r}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(3)
+xgboost_full <- train(x = select(eligible, vars),
+                 y = eligible$lapse, 
+                 method = "xgbTree",
+                 metric = "ROC",
+                 trControl = trainControl(method = "none",
+                                          classProbs = T),
+                 tuneGrid =  expand.grid(nrounds = 3300, #the maximum number of iterations
+                                         eta = 0.01, # shrinkage
+                                         max_depth = 3, # max depth of a tree
+                                         gamma = 1,
+                                         colsample_bytree = 0.5,
+                                         min_child_weight = 2, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 0.7))
+ggplot(varImp(xgboost_full, scale = F))
+stopCluster(cl)
+proc.time() - time_start
+```
+
+
+Partial dependence plots
+
+Note that we had to remove the outliers and create a new model, otherwise the plots will show the outliers and the insight won't be as clear. 
+```{r}
+cl <- makePSOCKcluster(10)
+registerDoParallel(cl)
+set.seed(3)
+xgboost_partial <- train(x = train_data_dedummified[train_data_dedummified$TRANS12X <= 500, vars],
+                 y = train_data[train_data$TRANS12X <= 500, ]$lapse, 
+                 method = "xgbTree",
+                 metric = "ROC",
+                 trControl = trainControl(method = "none",
+                                          classProbs = T),
+                 tuneGrid =  expand.grid(nrounds = 3300, #the maximum number of iterations
+                                         eta = 0.01, # shrinkage
+                                         max_depth = 3, # max depth of a tree
+                                         gamma = 1,
+                                         colsample_bytree = 0.5,
+                                         min_child_weight = 2, # Larger values are more robust than smaller values (less likely to result in overfitting).
+                                         subsample = 0.7))
+ggplot(varImp(xgboost_partial, scale = F))
+stopCluster(cl)
+
+partial(xgboost_partial, pred.var = c("TRANS12X"), prob = T, which.class = 2, plot = T, rug = T, plot.engine = "ggplot")
+
+## if we don't specify prob = T, the values in the chart are log values. 
+partial(xgboost_partial, pred.var = c("INVLNS12"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+partial(xgboost_partial, pred.var = c("Trans_6M_pre"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+
+partial(xgboost_partial, pred.var = c("SHIP_T12X"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot" )
+
+partial(xgboost_partial, pred.var = c("LINES12X"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+partial(xgboost_partial, pred.var = c("mrospend"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+partial(xgboost_partial, pred.var = c("DISTANCE"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+partial(xgboost_partial, pred.var = c("BRRET_S12X"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+partial(xgboost_partial, pred.var = c("DUNSYRST"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+partial(xgboost_partial, pred.var = c("SAFTS12X_pct"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+partial(xgboost_partial, pred.var = c("EPROC_S12X"), which.class = 2, prob =  T, plot = T, rug = T, plot.engine = "ggplot")
+
+
+# The following code didn't work.
+# pdps <- list()
+# for (feature in vars[1:10]) {
+#   pdps[[feature]] <- partial(xgboost_partial, pred.var = feature, 
+#                              prob = T, which.class = 2)
+# }
+# grid.arrange(grobs = pdps, ncol = 3)
+
+train_data <- train_data %>%
+  mutate(pred = predict(xgboost_full, newdata = train_data[, vars], type = "prob")[, 2],
+         label = ifelse(pred >= 0.5, 1, 0))
+ggplot(train_data, aes(x = TRANS12X, y = pred)) + 
+    geom_point() + xlim(c(0, 500)) + 
+    ylab("predicted lapse probability") 
+
+
+
+# ggplot(train_data, aes(x = TRANS12X)) + geom_density(aes(color = as.factor(label))) + xlim(c(0, 500))
+
+# qplot(TRANS12X, data = train_data, geom = "histogram",
+#       fill = as.factor(label)) + xlim(c(0, 500))
+
+## good visual
+ggplot(train_data, aes(x = TRANS12X)) + 
+  geom_histogram(aes(color = as.factor(label)), fill = "white", position = "dodge") +
+  xlim(c(0, 500))
+
+ggplot(train_data, aes(x = TRANS12X)) + geom_area(aes(fill = as.factor(label)), stat ="bin", alpha=0.6) + xlim(c(0, 500))
+
+### The following two create the same chart with a smooth line.
+ggplot(train_data, aes(x = TRANS12X, y = pred)) + geom_point() + geom_smooth(method = "auto") + xlim(c(0, 500))
+qplot(TRANS12X, pred, data = train_data, 
+      geom = c("point", "smooth")) + xlim(c(0, 500))
+
+### Only smooth line, no points.
+qplot(TRANS12X, pred, data = train_data, geom = "smooth") + xlim(c(0, 500))
+
+## show % of lapse vs non lapse
+ggplot(train_data, aes(x = TRANS12X, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + xlim(c(0, 500)) + 
+    ylab("% of locations")
+
+
+```
+
+Generate the charts with prefered style. Take sample otherwise it's much slower.
+```{r}
+qplot(TRANS12X, pred, data = sample_frac(train_data, size = 0.1), 
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Trans 12X") + xlim(c(0, 500))
+
+qplot(INVLNS12, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Invoice lines 12X") + xlim(c(0, 500))
+
+qplot(Trans_6M_pre, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Most recent 6 mo. Trans") + xlim(c(0, 500))
+
+qplot(RECENCY, pred, data = sample_frac(train_data, size = 0.1), 
+      geom =  c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Purchase recency")
+
+qplot(SHIP_T12X, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Ship Trans 12X") + xlim(c(0, 2500))
+
+qplot(BRRET_S12X, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Branch Return Sales 12X") + xlim(c(-5000, 0))
+
+qplot(EPROC_S12X, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Epro Sales 12X") + xlim(c(0, 25000))
+
+qplot(SHIP_T36X, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Ship Trans 36X") + xlim(c(0, 1000))
+
+qplot(DUNSYRST, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("Year started") + xlim(c(1850, 2018))
+
+qplot(LINES12X, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("# of product segments purchased 12X") + xlim(c(0, 35))
+
+qplot(SAFTS12X_pct, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("% of safty sales 12X") + xlim(c(0, 0.5))
+
+qplot(EPRO_sales_perct, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("% of EPRO sales 12X") + xlim(c(0, 0.8))
+
+train_data <- train_data %>%
+  mutate(Ship_trans_perct = SHIP_T12X / TRANS12X,
+         Return_Sales_perct = abs(BRRET_S12X) / SALES12X,
+         EPRO_sales_perct = EPROC_S12X / SALES12X)
+
+qplot(Ship_trans_perct, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("% of ship trans 12X") + xlim(c(0, 0.8))
+
+qplot(EPRO_sales_perct, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("% of EPRO Sales") + xlim(c(0, 0.8))
+
+qplot(Return_Sales_perct, pred, data = sample_frac(train_data, size = 0.1),
+      geom = c("point", "smooth")) + ylab("Predicted 3-month-inactive risk") + xlab("% of branch return Sales") + xlim(c(0, 0.1))
+
+
+ggplot(train_data, aes(x = Trans_12M_pre, fill = lapse)) + 
+    geom_bar() + xlim(c(0, 500)) + 
+    ylab("# of locations") 
+
+ggplot(train_data, aes(x = Trans_3M_pre, fill = lapse)) +
+  geom_bar() + xlim(c(0, 500)) + ylab("# of locations")
+
+ggplot(train_data, aes(x = INVLNS12, fill = lapse)) +
+  geom_bar() + xlim(c(0, 500)) + ylab("# of locations")
+
+ggplot(train_data, aes(x = TENURE, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + xlim(c(0, 500)) + 
+    ylab("% of locations") 
+
+ggplot(train_data, aes(x = TENURE, fill = lapse)) +
+  geom_bar() + xlim(c(0, 500)) + ylab("# of locations")
+
+ggplot(train_data, aes(x = EPROC_S12X, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + xlim(c(0, 50000)) + 
+    ylab("% of locations") 
+
+ggplot(train_data, aes(x = DUNSYRST, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + xlim(c(1900, 2020)) + 
+    ylab("% of locations")
+
+ggplot(train_data, aes(x = DUNSYRST, fill = lapse)) +
+  geom_bar() + xlim(c(1900, 2020))  + ylab("# of locations")
+
+ggplot(train_data, aes(x = BRRET_S12X, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + xlim(c(-2500, 0)) + 
+    ylab("% of locations")
+
+ggplot(train_data, aes(x = LINES12X, fill = lapse)) + 
+    geom_histogram(position = "fill") + xlim(c(0, 36)) + 
+    ylab("% of locations")
+
+ggplot(train_data, aes(x = SHIP_T12X, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + 
+    ylab("% of locations")
+
+ggplot(train_data, aes(x = SHIP_T12X, fill = lapse)) +
+  geom_bar() + xlim(c(0, 20000)) + ylab("# of locations")
+
+ggplot(train_data, aes(x = SAFTS12X_pct, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + xlim(c(0, 1)) + 
+    ylab("% of locations")
+
+ggplot(train_data, aes(x = MAIL12X, fill = lapse)) + 
+    geom_histogram(position = "fill", bins = 100) + xlim(c(0, 200)) + 
+    ylab("% of locations")
+
+### Need to de dummify the categorical variables.
+ggplot(train_data, aes(x = mro_decile)) + geom_bar(aes(fill = lapse))
+```
+
+Excel friendly charts.
+```{r}
+train_data <- train_data %>%
+  mutate(Trans12x_group = ntile(TRANS12X, 10),
+         INVLNS12_group = ntile(INVLNS12, 10),
+         Trans_6M_pre_group = ntile(Trans_6M_pre, 10), 
+         Recency_group = ntile(RECENCY, 10),
+         SHIP_T12X_group = ntile(SHIP_T12X, 10),
+         Return_Sales_group = ntile(Return_Sales_perct, 10),
+         EPRO_sales_group = ntile(EPRO_sales_perct, 10),
+         SHIP_T36X_group = ntile(SHIP_T36X, 10),
+         MRO_group = ntile(mrospend, 10),
+         DUNSYRST_group = ntile(DUNSYRST, 10),
+         LINES12X_group = ntile(LINES12X, 10),
+         SAFTS12X_pct_group = ntile(SAFTS12X_pct, 10))
+
+train_data %>%
+  group_by(Trans12x_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(INVLNS12_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(Trans_6M_pre_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(Recency_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(SHIP_T12X_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(Return_Sales_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(EPRO_sales_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(SHIP_T36X_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(MRO_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(DUNSYRST_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(LINES12X_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(SAFTS12X_pct_group) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+
+train_data <- train_data %>%
+  mutate(EPRO_sales_range = ifelse(EPRO_sales_perct<= 0.025, "0.025",
+                                   ifelse(EPRO_sales_perct<= 0.05, "0.05",
+                                          ifelse(EPRO_sales_perct<= 0.1, "0.1", 
+                                                 ifelse(EPRO_sales_perct <= 0.2, "0.2",
+                                                        ifelse(EPRO_sales_perct <= 0.3, "0.3",
+                                                               ifelse(EPRO_sales_perct <= 0.4, "0.4",
+                                                                      ifelse(EPRO_sales_perct <= 0.5, "0.5",
+                                                                             ifelse(EPRO_sales_perct <= 0.6, "0.6", 
+                                                                                    ifelse(EPRO_sales_perct <= 0.7, "0.7", "0.8"))))))),
+                                          Return_Sales_range = ifelse(Return_Sales_perct<= 0.025, "0.025", 
+                                                                      ifelse(Return_Sales_perct <= 0.05, "0.05",
+                                                                             ifelse(Return_Sales_perct <= 0.075, "0.075", 0.1))),
+                                          safety_sales_range = ifelse(SAFTS12X_pct<= 0.025, "0.025",
+                                                                      ifelse(SAFTS12X_pct<= 0.05, "0.05", 
+                                                                             ifelse(SAFTS12X_pct <= 0.1, "0.1",
+                                                                                    ifelse(SAFTS12X_pct <= 0.2, "0.2",
+                                                                                           ifelse(SAFTS12X_pct <= 0.3, "0.3",
+                                                                                                  ifelse(SAFTS12X_pct <= 0.4, "0.4",
+                                                                                                         ifelse(SAFTS12X_pct <= 0.5, "0.5",
+                                                                                                                ifelse(SAFTS12X_pct <= 0.6, "0.6", 
+                                                                                                                       ifelse(SAFTS12X_pct <= 0.7, "0.7", "0.8"))))))))))))
+
+train_data %>%
+  group_by(EPRO_sales_range) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(Return_Sales_range) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+
+train_data %>%
+  group_by(safety_sales_range) %>%
+  summarise(locations = n(),
+            "predicted 3-month-inactive risk" = mean(pred))
+```
+
+
+### Validate the model on a different cohort
+
+Construct the validation dataset by taking January model file as independent vars and merging with May model file using Mar-May as dependent var.
+
+Remember to exclude off-account locations.
+```{r}
+dep_vars <- fread('/hadoop/grainger/data_science/inputFiles/modelFiles/201905_May_merged_model_file.csv', data.table = F)
+dep_vars <- dep_vars %>%
+  filter(BUS_LOC_ID != 0 & ACCOUNT %in% c(111111118, 222222226, 244444444) == F) %>%
+  mutate(Trans_3M = rowSums(select(., TRANS03:TRANS01))) %>%
+  select(ACCOUNT, Trans_3M)
+summary(dep_vars$Trans_3M)
+
+ind_vars <- fread('/hadoop/grainger/data_science/inputFiles/modelFiles/201901_Jan_merged_model_file_NEW.csv', data.table = F)
+
+ind_vars <- ind_vars %>%
+  filter(ACCOUNT %in% c(111111118, 222222226, 244444444) == F)
+```
+
+#### merge the two files using account number first. 
+
+- it's not a good idea to aggregate the two files to BUS LOC level and then merge the two files because bus location ID got re-stated often.
+```{r}
+merge_val <- left_join(ind_vars, dep_vars, by = "ACCOUNT")
+rm(ind_vars)
+rm(dep_vars)
+```
+
+
+#### Function to aggregate the data to location level and feature engineering
+```{r}
+loc_aggr_fe_func <- function(x){
+  loc_aggr_sum <- x %>%
+    group_by(BUS_LOC_ID) %>%
+    summarise_at(vars(BRNCH_S12X:INVLNS24, TRANS36:WA_S12X, LINES12X:WLDGN24X, Trans_3M), sum, na.rm = T) 
+  ### had to split the following commands because otherwise it was taking long. 
+  x <- x %>% arrange(desc(-BUS_LOC_ID), desc(SALES12X), desc(mrospend))
+  
+  loc_aggr_first <- x %>%
+    group_by(BUS_LOC_ID) %>%
+    summarise_at(vars(CSG, EMPHERE, DUNSYRST:dunspop, indseg1, Corp_Maj_Flag,
+                      market_segment), first)
+  
+  loc_aggr_min <- x %>%
+    group_by(BUS_LOC_ID) %>%
+    summarise_at(vars(RECENCY, DISTANCE, mro_decile), min)
+  
+  loc_aggr_max <- x %>%
+    group_by(BUS_LOC_ID) %>%
+    summarise_at(vars(TENURE, mrospend, INVSOLFLG, multisite, CONTRACT_FLAG), max)
+  
+  
+  loc_aggr_x <- full_join(loc_aggr_sum, loc_aggr_first) %>%
+    full_join(loc_aggr_min) %>%
+    full_join(loc_aggr_max)
+  
+  rm(loc_aggr_first)
+  rm(loc_aggr_sum)
+  rm(loc_aggr_min)
+  rm(loc_aggr_max)
+  loc_aggr_x <- ungroup(loc_aggr_x)
+
+  ## feature engineering
+  loc_aggr_x <- loc_aggr_x %>%
+    filter(BUS_LOC_ID != 0) %>%
+    mutate(BUS_LOC_ID = as.character(BUS_LOC_ID),
+           mro_decile = as.factor(mro_decile),
+           Corp_Maj_Flag = as.factor(Corp_Maj_Flag),
+           multisite = as.factor(multisite),
+           indseg1 = as.factor(indseg1),
+           CONTRACT_FLAG = as.factor(CONTRACT_FLAG),
+           coverage = ifelse(substr(CSG, 1, 2) %in% seq(72, 78), "ISA",
+                             ifelse(substr(CSG, 1, 2) %in% c(84, 88), "AM",
+                                    ifelse(substr(CSG, 1, 2) == 83, "FAR", 
+                                           ifelse(substr(CSG, 1, 2) == 89, "Gov ARM",
+                                                  "Uncovered")))),
+           coverage = as.factor(coverage),
+           dunsman = as.factor(dunsman),
+           dunsstat = as.factor(dunsstat),
+           dunssub = as.factor(dunssub),
+           Trans_3M_pre = rowSums(select(., TRANS03:TRANS01)),
+           Trans_6M_pre = rowSums(select(., TRANS06:TRANS01)),
+           Trans_12M_pre = rowSums(select(., TRANS12:TRANS01)),
+           SALES_3M_pre = rowSums(select(., SALES03:SALES01)),
+           SALES_6M_pre = rowSums(select(., SALES06:SALES01)),
+           SALES_12M_pre = rowSums(select(., SALES12:SALES01))
+    )
+
+pct_cal <- sapply(names(loc_aggr_x)[which(colnames(loc_aggr_x) == "ABRVS12X"):which(colnames(loc_aggr_x) == "WLDGS12X")], function(x) {
+  loc_aggr_x[paste0(x, "_pct")] <<- loc_aggr_x[x] / loc_aggr_x$SALES12X
+})
+rm(pct_cal)
+colnames(loc_aggr_x) <- make.names(names(loc_aggr_x), unique=TRUE)
+
+
+### create dummy variables.
+loc_aggr_x <- loc_aggr_x %>% 
+  to_dummy(c(Corp_Maj_Flag, mro_decile, indseg1, CONTRACT_FLAG, multisite, coverage, dunsstat, dunssub, dunsman), suffix = "label") %>%
+  bind_cols(loc_aggr_x) %>%
+  select(BUS_LOC_ID:DISTANCE, everything())
+
+return(loc_aggr_x)
+}
+```
+
+
+#### Execute the location aggr and feature engineering function
+```{r}
+merge_val  <- loc_aggr_fe_func(merge_val )
+sort(colSums(is.na(merge_val)))
+
+### Take care of missing values
+merge_val  <- merge_val  %>%
+  mutate(DISTANCE= ifelse(is.na(DISTANCE), mean(DISTANCE, na.rm=TRUE), DISTANCE)) %>%
+  replace(is.na(.), 0)
+
+sort(colSums(is.na(merge_val )))
+which(sapply(merge_val, is.factor))
+which(sapply(merge_val, is.character))
+sapply(merge_val, class)
+
+```
+
+#### compare the stats of lapsed locations from different cohort
+```{r}
+merge_val <- merge_val %>%
+  mutate(Trans_3M = ifelse(is.na(Trans_3M), 0, Trans_3M),
+         lapse = ifelse(Trans_3M == 0, "Yes", "No"))
+
+prop.table(table(filter(merge_val, TRANS01 > 0)$lapse))
+
+### Look at volume.
+merge_val %>%
+  filter(TRANS01 > 0) %>%
+  group_by(lapse) %>%
+  summarise(count = n(),
+            sales_avg = mean(SALES12X),
+            sales = sum(SALES12X))
+
+merge_val %>%
+  select(-Trans_3M) %>%
+  mutate(Trans_3M = rowSums(select(., TRANS03:TRANS01)), 
+         Trans_3M = ifelse(is.na(Trans_3M), 0, Trans_3M),
+         lapse = ifelse(Trans_3M == 0, "Yes", "No"),
+         sales_pre12 = rowSums(select(., SALES16:SALES05))) %>%
+  filter(TRANS05 > 0) %>%
+  group_by(lapse) %>%
+  summarise(count = n(),
+            sales_avg = mean(sales_pre12),
+            sales = sum(sales_pre12))
+
+merge_val %>%
+  select(-Trans_3M) %>%
+  mutate(Trans_3M = rowSums(select(., TRANS04:TRANS02)), 
+         Trans_3M = ifelse(is.na(Trans_3M), 0, Trans_3M),
+         lapse = ifelse(Trans_3M == 0, "Yes", "No"),
+         sales_pre12 = rowSums(select(., SALES17:SALES06))) %>%
+  filter(TRANS06 > 0) %>%
+  group_by(lapse) %>%
+  summarise(count = n(),
+            sales_avg = mean(sales_pre12),
+            sales = sum(sales_pre12))
+
+
+```
+
+#### Validate the model on the new dataset constructed by Jan 2019 cohort.
+```{r}
+
+val_score <- predict(xgboost_full, newdata = merge_val[merge_val$TRANS01 > 0, vars], type = "prob")
+dt = lift(merge_val[merge_val$TRANS01 > 0, ]$lapse == "Yes", val_score[, 2], groups = 10)
+dt
+plot(dt$bucket, dt$Cumlift, type="l", ylab="Cumulative lift", xlab="Bucket")
+
+confusionMatrix(as.factor(val_score[, 2] > 0.5), as.factor(merge_val[merge_val$TRANS01 > 0, ]$lapse == "Yes"), positive = "TRUE")
+
+```
+
+
+### Profile the customers
+```{r}
+profiling <- merge_val %>%
+  select(-lapse, -SALES_12M_pre) %>%
+  filter(TRANS01 > 0) %>%
+  mutate(lapse = ifelse(Trans_3M == 0, "Yes", "No"))
+
+## Reverse dummy coding
+library(tidyverse)
+Corp_Maj_Flag <-profiling[, 299:306] %>% gather(Corp_Maj_Flag, Count) %>% filter(Count >= 1) %>%
+  select(Corp_Maj_Flag)
+
+mro_decile <- profiling[, 307:316] %>% gather(mro_decile, Count) %>% filter(Count >= 1) %>%
+  select(mro_decile)
+
+industry <- profiling[, 317:331] %>% gather(industry, Count) %>% filter(Count >= 1) %>%
+  select(industry)
+
+coverage <- profiling[, 336:340] %>% gather(coverage, Count) %>% filter(Count >= 1) %>%
+  select(coverage)
+
+Corp_Maj_Flag <-profiling[, 299:306] %>% gather(Corp_Maj_Flag, Count) %>%
+  select(Corp_Maj_Flag)
+
+mro_decile <- profiling[, 307:316] %>% gather(mro_decile, Count) %>%
+  select(mro_decile)
+
+industry <- profiling[, 317:331] %>% gather(industry, Count) %>%
+  select(industry)
+
+coverage <- profiling[, 336:340] %>% gather(coverage, Count) %>%
+  select(coverage)
+
+profiling <- cbind(profiling, Corp_Maj_Flag, mro_decile, industry, coverage)
+rm(Corp_Maj_Flag)
+rm(mro_decile)
+rm(industry)
+rm(coverage)
+names(profiling)
+
+
+prop.table(table(profiling$lapse))
+tapply(profiling$mrospend, profiling$lapse, mean)
+tapply(profiling$TRANS12X, profiling$lapse, mean)
+tapply(profiling$SALES12X, profiling$lapse, mean)
+profiling %>% group_by(mro_decile) %>% summarise(lapse_rate = mean(lapse == "Yes"))
+profiling %>% group_by(industry) %>% summarise(lapse_rate = mean(lapse == "Yes"))
+profiling %>% 
+  group_by(industry, lapse) %>% 
+  summarise(locations = n(),
+            sales12x = sum(SALES12X)) %>%
+  mutate(locs_perct = locations / sum(locations),
+         sales_perct = sales12x / sum(sales12x))
+tapply(profiling$lapse == "Yes", profiling$Corp_Maj_Flag, mean)
+tapply(profiling$lapse == "Yes", profiling$coverage, mean)
+
+### It looks like using mro_decile and mro_decile_10 result in different numbers!!
+profiling %>%
+  group_by(mro_decile) %>%
+  summarise(locations = n(),
+            lapse_locs = sum(lapse == "Yes"),
+            lapse_rate = mean(lapse == "Yes"))
+
+profiling %>%
+  group_by(indseg1) %>%
+  summarise(locations = n(),
+            lapse_locs = sum(lapse == "Yes"),
+            lapse_rate = mean(lapse == "Yes"))
+
+profiling %>%
+  group_by(coverage) %>%
+  summarise(locations = n(),
+            lapse_locs = sum(lapse == "Yes"),
+            lapse_rate = mean(lapse == "Yes"))
+
+```
+
+
+################################################################################
+Model Scoring
+################################################################################
+
+### Import file for scoring
+```{r}
+scoring <- fread('/hadoop/grainger/data_science/inputFiles/modelFiles/201907_Jul_merged_model_file.csv', data.table = F)
+
+on_account <- scoring %>%
+  mutate(on_account = ifelse(ACCOUNT > 800000000, 1, 0))%>%
+  group_by(BUS_LOC_ID) %>%
+  summarise(on_account_locs = sum(on_account)) %>%
+  ungroup()
+
+scoring <- inner_join(scoring, on_account, by = "BUS_LOC_ID") %>%
+  filter(on_account_locs >= 1)
+
+# summary(scoring$on_account_locs)
+```
+
+### Aggregate to location level
+```{r}
+loc_aggr_sum <- scoring %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(BRNCH_S12X:INVLNS24, TRANS36:WA_S12X, LINES12X:WLDGN24X), sum, na.rm = T) 
+### had to split the following commands because otherwise it was taking long. 
+scoring <- scoring %>% arrange(desc(-BUS_LOC_ID), desc(SALES12X), desc(mrospend))
+
+loc_aggr_first <- scoring %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(CSG, EMPHERE, DUNSYRST:dunspop, indseg1, Corp_Maj_Flag, market_segment), first)
+
+loc_aggr_min <- scoring %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(RECENCY, DISTANCE, mro_decile, FIRST_PURCH_DT), min)
+
+loc_aggr_max <- scoring %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(TENURE, mrospend, INVSOLFLG, multisite, CONTRACT_FLAG), max)
+
+
+loc_aggr_scoring <- full_join(loc_aggr_sum, loc_aggr_first) %>%
+  full_join(loc_aggr_min) %>%
+  full_join(loc_aggr_max)
+
+rm(loc_aggr_first)
+rm(loc_aggr_sum)
+rm(loc_aggr_min)
+rm(loc_aggr_max)
+loc_aggr_scoring <- ungroup(loc_aggr_scoring)
+str(loc_aggr_scoring)
+rm(scoring)
+```
+
+
+### feature engineering on scoring data
+```{r}
+loc_aggr_scoring <- loc_aggr_scoring %>%
+  filter(BUS_LOC_ID != 0) %>%
+  mutate(BUS_LOC_ID = as.character(BUS_LOC_ID),
+         mro_decile = as.factor(mro_decile),
+         Corp_Maj_Flag = as.factor(Corp_Maj_Flag),
+         multisite = as.factor(multisite),
+         indseg1 = as.factor(indseg1),
+         CONTRACT_FLAG = as.factor(CONTRACT_FLAG),
+         coverage = ifelse(substr(CSG, 1, 2) %in% seq(72, 78), "ISA",
+                           ifelse(substr(CSG, 1, 2) %in% c(84, 88), "AM",
+                                  ifelse(substr(CSG, 1, 2) == 83, "FAR", 
+                                         ifelse(substr(CSG, 1, 2) == 89, "Gov ARM",
+                                                       "Uncovered")))),
+         coverage = ifelse(is.na(coverage), "Uncovered", coverage),
+         coverage = as.factor(coverage),
+         dunsman = as.factor(dunsman),
+         dunsstat = as.factor(dunsstat),
+         dunssub = as.factor(dunssub),
+         Trans_3M_pre = rowSums(select(., TRANS03:TRANS01)),
+         Trans_6M_pre = rowSums(select(., TRANS06:TRANS01)),
+         Trans_12M_pre = rowSums(select(., TRANS12:TRANS01)),
+         SALES_3M_pre = rowSums(select(., SALES03:SALES01)),
+         SALES_6M_pre = rowSums(select(., SALES06:SALES01)),
+         SALES_12M_pre = rowSums(select(., SALES12:SALES01))
+         )
+
+### Create tenure_adj variable based on first_purch_DT.
+loc_aggr_scoring <- loc_aggr_scoring %>%
+  mutate(FIRST_PURCH_DT = as.Date(FIRST_PURCH_DT, "%m/%d/%Y"),
+    tenure_adj = ifelse(is.na(FIRST_PURCH_DT) != T, interval(FIRST_PURCH_DT, as.Date('7/29/2019', "%m/%d/%Y")) %/% months(1) + 1,
+                        ifelse(is.na(FIRST_PURCH_DT) & TENURE >= interval(ymd("20160101"), ymd("20190729")) %/% months(1), TENURE, 
+                               ifelse(is.na(FIRST_PURCH_DT) & SALES12X > 0 & SALES24X + SALES36X == 0, 6, 18))),
+    active13 = rowSums(select(., TRANS24:TRANS13)) > 0,
+    new_flag = tenure_adj >=1 & tenure_adj <=12 & active13 == F)
+
+
+# sanity check
+table(loc_aggr_scoring$new_flag)
+View(select(loc_aggr_scoring, BUS_LOC_ID, FIRST_PURCH_DT, TENURE, tenure_adj, new_flag))
+
+### Above we filter out new customers, but moving forward we may need to just exclude the customers who are in the early life cycle program, it could be 6 months or 3 months, etc.
+
+pct_cal <- sapply(names(loc_aggr_scoring)[which(colnames(loc_aggr_scoring) == "ABRVS12X"):which(colnames(loc_aggr_scoring) == "WLDGS12X")], function(x) {
+  loc_aggr_scoring[paste0(x, "_pct")] <<- loc_aggr_scoring[x] / loc_aggr_scoring$SALES12X
+})
+rm(pct_cal)
+colnames(loc_aggr_scoring) <- make.names(names(loc_aggr_scoring), unique=TRUE)
+names(loc_aggr_scoring)
+```
+
+
+- Create dummy variables
+Check how many factor variables are there in the dataset and create dummy variables
+Leave dummy variables as numeric because xgboost only takes in numeric variables. 
+```{r, echo=TRUE}
+names(Filter(is.factor, loc_aggr_scoring))
+loc_aggr_scoring <- loc_aggr_scoring %>% 
+  to_dummy(c(Corp_Maj_Flag, mro_decile, indseg1, CONTRACT_FLAG, multisite, coverage, dunsstat, dunssub, dunsman), suffix = "label") %>%
+  bind_cols(loc_aggr_scoring) %>%
+  select(BUS_LOC_ID:DISTANCE, everything())
+names(Filter(is.factor, loc_aggr_scoring))
+```
+
+#### Inspect the final dataset
+
+Recode distance and sales by Boldt's segmentation (those locations didn't have sales that fall into the segmentations). Recode multiple columns from missing values to zero. 
+Missing values happen because - 
+- some number of locations didn't have sales that fall into the Boldt segmentation
+- divide by zero sales12x.
+
+Drop empty levels for factor variables.
+```{r}
+sort(colSums(is.na(loc_aggr_scoring)))
+loc_aggr_scoring <- loc_aggr_scoring %>%
+  mutate(DISTANCE= ifelse(is.na(DISTANCE), mean(DISTANCE, na.rm=TRUE), DISTANCE)) %>%
+  select(-FIRST_PURCH_DT) %>%
+  replace(is.na(.), 0)
+
+sort(colSums(is.na(loc_aggr_scoring)))
+which(sapply(loc_aggr_scoring, is.factor))
+which(sapply(loc_aggr_scoring, is.character))
+sapply(loc_aggr_scoring, class)
+
+```
+
+#### Make predictions and save the file
+```{r}
+lapse_score <- predict(xgboost_full, newdata = loc_aggr_scoring[, vars], type = "prob")
+loc_aggr_scoring <- loc_aggr_scoring %>%
+  mutate(lapse_score = lapse_score[, 2])
+rm(lapse_score)
+```
+
+
+### Import goals data and aggregate to location level
+Make sure to customize month range for goals. 
+```{r}
+goals <- fread('goals.csv', data.table = F)
+goals_aggr <- goals %>%
+  filter(BUS_LOC_ID != 0) %>%
+  group_by(BUS_LOC_ID) %>%
+  summarise_at(vars(Jul_Goal:Dec_Goal), sum, na.rm = T) %>%
+  ungroup() %>%
+  mutate(BUS_LOC_ID = as.character(BUS_LOC_ID),
+         sales_goals = rowSums(select(., Aug_Goal:Oct_Goal)))
+rm(goals)
+```
+
+### Merge with scoring data
+```{r}
+loc_aggr_scoring <- left_join(loc_aggr_scoring, goals_aggr) %>%
+  replace(is.na(.), 0)
+sort(colSums(is.na(loc_aggr_scoring)))
+```
+
+
+### Comparing highest risk customers under different definitions of dollars at risk
+```{r}
+loc_aggr_scoring <- loc_aggr_scoring %>%
+  mutate(dollars_at_risk_3M_pre = SALES_3M_pre,
+         dollars_at_risk_12M_pre = SALES_12M_pre/4,
+         dollars_at_risk_goals = sales_goals,
+         dollars_at_risk_py_sales = rowSums(select(., SALES11:SALES09)))
+
+# top_decile_3M <- eligible_scoring %>%
+#   arrange(desc(dollars_at_risk_3M_pre)) %>%
+#   filter(row_number() / n() <= .2) %>%
+#   select(BUS_LOC_ID, lapse_score, dollars_at_risk_3M_pre, SALES_3M_pre)
+# 
+# top_decile_12M <- eligible_scoring %>%
+#   arrange(desc(dollars_at_risk_12M_pre)) %>%
+#   filter(row_number() / n() <= .2) %>%
+#   select(BUS_LOC_ID, lapse_score, dollars_at_risk_12M_pre, SALES_12M_pre)
+# 
+# top_decile_goals <- eligible_scoring %>%
+#   arrange(desc(dollars_at_risk_goals)) %>%
+#   filter(row_number() / n() <= .2) %>%
+#   select(BUS_LOC_ID, lapse_score, dollars_at_risk_goals, sales_goals)
+
+# merge_top <- full_join(top_decile_3M, top_decile_goals, by = c("BUS_LOC_ID", "lapse_score")) %>%
+#   full_join(top_decile_12M, by = c("BUS_LOC_ID", "lapse_score"))
+# sort(colSums(is.na(merge_top)))
+
+
+```
+
+### Define the dollars at risk 
+
+Max of sales goals, py sales, R12 sales. 
+
+```{r}
+loc_aggr_scoring <- loc_aggr_scoring %>%
+  mutate(dollars_at_risk = pmax(dollars_at_risk_3M_pre, dollars_at_risk_12M_pre, 
+                                dollars_at_risk_goals, dollars_at_risk_py_sales)) %>%
+  select(BUS_LOC_ID, lapse_score, dollars_at_risk_3M_pre:dollars_at_risk_py_sales, dollars_at_risk, everything())
+```
+
+#### Only look at 3-month active locations
+
+```{r}
+# eligible_scoring <- eligible_scoring %>%
+#   filter(TRANS12X > 0)
+
+# eligible_scoring <- eligible_scoring %>%
+#   filter(Trans_6M_pre > 0 & new_flag == F)
+
+eligible_scoring <- loc_aggr_scoring %>%
+  filter(Trans_3M_pre > 0 & new_flag == F)
+
+# eligible_scoring <- eligible_scoring %>%
+#   filter(TRANS01 > 0 & new_flag == F)
+
+# eligible_scoring <- eligible_scoring %>%
+#   filter(new_flag == T)
+```
+
+
+Get some stats on the groups ranked by expected revenue loss. 
+```{r}
+eligible_scoring <- eligible_scoring %>%
+  mutate(exp_rev_loss = dollars_at_risk * lapse_score,
+         rank_exp_loss = ntile(-exp_rev_loss, 10))
+
+eligible_scoring %>%
+  group_by(rank_exp_loss) %>%
+  summarise(locs = n(),
+            avg_lapse_prob = mean(lapse_score),
+            avg_revenue_risk = mean(dollars_at_risk),
+            avg_exp_loss = mean(exp_rev_loss),
+            exp_loss_total = sum(exp_rev_loss),
+            avg_R12_sales = mean(SALES12X),
+            avg_mro = mean(mrospend),
+            TRANS12X = mean(TRANS12X),
+            LINES12X = mean(LINES12X))
+
+eligible_scoring <- eligible_scoring %>%
+  select(BUS_LOC_ID, lapse_score, dollars_at_risk, exp_rev_loss, rank_exp_loss, everything())
+
+### by decile range
+eligible_scoring %>%
+  mutate(rank_exp_loss_range = ifelse(rank_exp_loss == 1, "Decile 1",
+                                      ifelse(rank_exp_loss <= 4, "Decile 2-4",
+                                             ifelse(rank_exp_loss <= 7, "Decile 5-7", "Decile 8-10")))) %>%
+  group_by(rank_exp_loss_range) %>%
+  summarise(locs = n(),
+            avg_lapse_prob = mean(lapse_score),
+            avg_exp_loss = mean(exp_rev_loss),
+            avg_R12_sales = mean(SALES12X),
+            avg_mro = mean(mrospend),
+            TRANS12X = mean(TRANS12X),
+            LINES12X = mean(LINES12X),
+            avg_monthly_sales = mean(SALES12X)/12) %>%
+  select(-rank_exp_loss_range) %>%
+  transpose() %>%
+  bind_cols(loc_aggr_scoring %>%
+              filter(TRANS12X > 0) %>%
+              mutate(exp_rev_loss = dollars_at_risk * lapse_score,
+                     rank_exp_loss = ntile(-exp_rev_loss, 10)) %>%
+              summarise(locs = n(),
+                        avg_lapse_prob = mean(lapse_score),
+                        avg_exp_loss = mean(exp_rev_loss),
+                        avg_R12_sales = mean(SALES12X),
+                        avg_mro = mean(mrospend),
+                        TRANS12X = mean(TRANS12X),
+                        LINES12X = mean(LINES12X),
+                        avg_monthly_sales = mean(SALES12X)/12) %>%
+              transpose())
+
+eligible_scoring <- eligible_scoring %>%
+  select(BUS_LOC_ID, lapse_score, dollars_at_risk, exp_rev_loss, rank_exp_loss, everything())
+
+
+save(eligible_scoring, xgboost_full, xgboost_vars, vars, loc_aggr_scoring, file = "scoring.RData")
+```
+
+More stats for each decile of expected revenue loss
+```{r}
+eligible_scoring %>%
+  group_by(rank_exp_loss) %>%
+  summarise(locs = n(),
+            contract_perct = mean(CONTRACT_FLAG ==  1),
+            coverage_perct = mean(coverage != "Uncovered"),
+            SALES12X = sum(SALES12X),
+            SALES24X = sum(SALES24X),
+            GDCOM_S12X = sum(GDCOM_S12X),
+            BRNCH_S12X = sum(BRNCH_S12X),
+            PHONE_S12X = sum(PHONE_S12X),
+            EPROC_S12X = sum(EPROC_S12X),
+            KPSTK_S12X = sum(KPSTK_S12X),
+            SHIP_S12X = sum(SHIP_S12X),
+            CNTR_S12X = sum(CNTR_S12X),
+            WCAL_S12X = sum(WCAL_S12X),
+            SAFTS12X = sum(SAFTS12X),
+            HVACS12X = sum(HVACS12X),
+            MTHDS12X = sum(MTHDS12X)) %>%
+  mutate(Sales_V = SALES12X / SALES24X - 1,
+         Gcom_perct = GDCOM_S12X / SALES12X,
+         Epro_perct = EPROC_S12X / SALES12X,
+         Branch_perct = BRNCH_S12X / SALES12X,
+         Phone_perct = PHONE_S12X / SALES12X,
+         KS_perct = KPSTK_S12X / SALES12X,
+         Ship_perct = SHIP_S12X / SALES12X,
+         CNTR_perct = CNTR_S12X / SALES12X,
+         WCAL_perct = WCAL_S12X / SALES12X,
+         Safety_perct = SAFTS12X / SALES12X,
+         HVAC_perct = HVACS12X / SALES12X,
+         MTHD_perct = MTHDS12X / SALES12X) %>%
+  select(rank_exp_loss, contract_perct:coverage_perct, Sales_V:MTHD_perct)
+
+### by decile range
+eligible_scoring %>%
+  mutate(rank_exp_loss_range = ifelse(rank_exp_loss == 1, "Decile 1",
+                                      ifelse(rank_exp_loss <= 4, "Decile 2-4",
+                                             ifelse(rank_exp_loss <= 7, "Decile 5-7", "Decile 8-10")))) %>%
+  group_by(rank_exp_loss_range) %>%
+  summarise(locs = n(),
+            contract_perct = mean(CONTRACT_FLAG ==  1),
+            coverage_perct = mean(coverage != "Uncovered"),
+            SALES12X = sum(SALES12X),
+            SALES24X = sum(SALES24X),
+            GDCOM_S12X = sum(GDCOM_S12X),
+            BRNCH_S12X = sum(BRNCH_S12X),
+            PHONE_S12X = sum(PHONE_S12X),
+            EPROC_S12X = sum(EPROC_S12X),
+            KPSTK_S12X = sum(KPSTK_S12X),
+            SHIP_S12X = sum(SHIP_S12X),
+            CNTR_S12X = sum(CNTR_S12X),
+            WCAL_S12X = sum(WCAL_S12X),
+            SAFTS12X = sum(SAFTS12X),
+            HVACS12X = sum(HVACS12X),
+            MTHDS12X = sum(MTHDS12X)) %>%
+  mutate(Sales_V = SALES12X / SALES24X - 1,
+         Gcom_perct = GDCOM_S12X / SALES12X,
+         Epro_perct = EPROC_S12X / SALES12X,
+         Branch_perct = BRNCH_S12X / SALES12X,
+         Phone_perct = PHONE_S12X / SALES12X,
+         KS_perct = KPSTK_S12X / SALES12X,
+         Ship_perct = SHIP_S12X / SALES12X,
+         CNTR_perct = CNTR_S12X / SALES12X,
+         WCAL_perct = WCAL_S12X / SALES12X,
+         Safety_perct = SAFTS12X / SALES12X,
+         HVAC_perct = HVACS12X / SALES12X,
+         MTHD_perct = MTHDS12X / SALES12X) %>%
+  select(contract_perct:coverage_perct, Sales_V:MTHD_perct) %>%
+  transpose() %>%
+  bind_cols(loc_aggr_scoring %>%
+              filter(TRANS12X > 0) %>%
+              mutate(exp_rev_loss = dollars_at_risk * lapse_score,
+                     rank_exp_loss = ntile(-exp_rev_loss, 10)) %>%
+              summarise(locs = n(),
+                        contract_perct = mean(CONTRACT_FLAG ==  1),
+                        coverage_perct = mean(coverage != "Uncovered"),
+                        SALES12X = sum(SALES12X),
+                        SALES24X = sum(SALES24X),
+                        GDCOM_S12X = sum(GDCOM_S12X),
+                        BRNCH_S12X = sum(BRNCH_S12X),
+                        PHONE_S12X = sum(PHONE_S12X),
+                        EPROC_S12X = sum(EPROC_S12X),
+                        KPSTK_S12X = sum(KPSTK_S12X),
+                        SHIP_S12X = sum(SHIP_S12X),
+                        CNTR_S12X = sum(CNTR_S12X),
+                        WCAL_S12X = sum(WCAL_S12X),
+                        SAFTS12X = sum(SAFTS12X),
+                        HVACS12X = sum(HVACS12X),
+                        MTHDS12X = sum(MTHDS12X)) %>%
+              mutate(Sales_V = SALES12X / SALES24X - 1,
+                     Gcom_perct = GDCOM_S12X / SALES12X,
+                     Epro_perct = EPROC_S12X / SALES12X,
+                     Ecom_perct = Gcom_perct + Epro_perct,
+                     Branch_perct = BRNCH_S12X / SALES12X,
+                     Phone_perct = PHONE_S12X / SALES12X,
+                     KS_perct = KPSTK_S12X / SALES12X,
+                     Ship_perct = SHIP_S12X / SALES12X,
+                     CNTR_perct = CNTR_S12X / SALES12X,
+                     WCAL_perct = WCAL_S12X / SALES12X,
+                     Safety_perct = SAFTS12X / SALES12X,
+                     HVAC_perct = HVACS12X / SALES12X,
+                     MTHD_perct = MTHDS12X / SALES12X) %>%
+  select(contract_perct:coverage_perct, Sales_V:MTHD_perct) %>%
+  transpose())
+
+
+
+eligible_scoring %>%
+  filter(rank_exp_loss == 1) %>%
+  group_by(mro_decile) %>%
+  tally()
+
+eligible_scoring %>%
+  filter(rank_exp_loss == 1) %>%
+  group_by(indseg1) %>%
+  tally()
+
+loc_aggr_scoring %>%
+  filter(TRANS12X > 0) %>%
+  mutate(exp_rev_loss = dollars_at_risk * lapse_score,
+         rank_exp_loss = ntile(-exp_rev_loss, 10)) %>%
+  group_by(indseg1) %>%
+  summarise(locs = n())
+  
+
+eligible_scoring %>%
+  filter(rank_exp_loss == 1) %>%
+  group_by(coverage) %>%
+  tally()
+
+eligible_scoring %>%
+  filter(rank_exp_loss == 1) %>%
+  group_by(CONTRACT_FLAG) %>%
+  tally()
+
+eligible_scoring %>%
+  filter(rank_exp_loss == 1) %>%
+  summarise(sales12x = mean(SALES12X))
+```
+
+### Test design
+```{r}
+### Remove outliers and then compare test/control group.
+### Decile 1
+set.seed(1)
+eligible_scoring %>%
+  arrange(desc(SALES_3M_pre)) %>%
+  filter(rank_exp_loss == 1 & SALES_3M_pre <= quantile(SALES_3M_pre, 0.9999)) %>%
+  mutate(group = ifelse(runif(nrow(filter(eligible_scoring, rank_exp_loss == 1 & SALES_3M_pre <= quantile(SALES_3M_pre, 0.9999)))) >= 0.5, "Test", "Control")) %>%
+  group_by(group) %>%
+  summarise(count = n(),
+            mean = mean(SALES_3M_pre),
+            sd = sd(SALES_3M_pre))
+
+## Decile 2-4
+set.seed(2)
+decile_2_4 <- eligible_scoring %>%
+  arrange(desc(SALES_3M_pre)) %>%
+  filter(rank_exp_loss %in% seq(2, 4, by = 1)) %>%
+  sample_frac(size = 0.3) %>%
+  filter(SALES_3M_pre <= quantile(SALES_3M_pre, 0.999))
+set.seed(2)
+decile_2_4 %>%
+  mutate(group = ifelse(runif(nrow(decile_2_4)) >= 0.5, "Test", "Control")) %>%
+  group_by(group) %>%
+  summarise(count = n(),
+            mean = mean(SALES_3M_pre),
+            sd = sd(SALES_3M_pre))
+
+## Decile 5-7 
+## take samples to create test/control otherwise the circulation will be too large.
+set.seed(2)
+decile_5_7 <- eligible_scoring %>%
+  arrange(desc(SALES_3M_pre)) %>%
+  filter(rank_exp_loss %in% seq(5,7,1)) %>%
+  sample_frac(size = 0.2) %>%
+  filter(SALES_3M_pre <= quantile(SALES_3M_pre, 0.9999))
+set.seed(2)
+decile_5_7 %>%
+  mutate(group = ifelse(runif(nrow(decile_5_7)) >= 0.5, "Test", "Control")) %>%
+  group_by(group) %>%
+  summarise(count = n(),
+            mean = mean(SALES_3M_pre),
+            sd = sd(SALES_3M_pre))
+
+## Decile 8-10 
+## take samples to create test/control otherwise the circulation will be too large.
+set.seed(3)
+decile_8_10 <- eligible_scoring %>%
+  arrange(desc(SALES_3M_pre)) %>%
+  filter(rank_exp_loss %in% seq(8, 10, by = 1)) %>%
+  sample_frac(size = 0.1) %>%
+  filter(SALES_3M_pre <= quantile(SALES_3M_pre, 0.9999))
+set.seed(4)
+decile_8_10 %>%
+  mutate(group = ifelse(runif(nrow(decile_8_10)) >= 0.5, "Test", "Control")) %>%
+  group_by(group) %>%
+  summarise(count = n(),
+            mean = mean(SALES_3M_pre),
+            sd = sd(SALES_3M_pre))
+
+### check the sales volume of the removed population
+eligible_scoring %>%
+  filter(rank_exp_loss %in% c(3, 4, 5)) %>%
+  summarise(sales_total = sum(SALES_3M_pre)) %>%
+  bind_cols(eligible_scoring %>% 
+              filter(rank_exp_loss %in% c(3, 4, 5) & SALES_3M_pre <= quantile(SALES_3M_pre, 0.9999)) %>%
+              summarise(sales_total_outliers_removed = sum(SALES_3M_pre)))
+
+```
+
+
+Create the 9 box grid
+```{r}
+top_decile <- eligible_scoring %>%
+  filter(rank_exp_loss == 1) %>%
+  mutate(mrospend_bucket = ifelse(mrospend <= 10000, "<=$10K",
+                                  ifelse(mrospend <= 40000, "$10-40K",
+                                         ">$40K")),
+         SOW = SALES12X / mrospend,
+         SOW_bucket = ifelse(SOW <= 0.15, "<15%",
+                             ifelse(SOW <= 0.35, "15%-35%",
+                                    ">35%")))
+
+top_decile %>%
+  group_by(mrospend_bucket) %>%
+  summarise(locs = n(),
+            sales = mean(SALES12X))
+
+
+
+top_decile %>%
+  group_by(SOW_bucket) %>%
+  summarise(locs = n(),
+            sales = mean(SALES12X))
+
+top_decile %>%
+  group_by(SOW_bucket, mrospend_bucket) %>%
+  summarise(locs = n(),
+            sales = sum(SALES12X))
+
+fwrite(select(top_decile, BUS_LOC_ID, exp_rev_loss, mrospend_bucket, SOW_bucket, mrospend, SOW), file = "at_risk_top_decile.csv")
+```
+
